@@ -1,9 +1,11 @@
 import {VoiceChannel, Snowflake} from 'discord.js';
 import {Readable} from 'stream';
 import hasha from 'hasha';
-import ytdl, {videoFormat} from '@distube/ytdl-core';
 import {WriteStream} from 'fs-capacitor';
 import ffmpeg from 'fluent-ffmpeg';
+import type {FfmpegCommand} from 'fluent-ffmpeg';
+import {spawn} from 'node:child_process';
+import type {ChildProcess} from 'node:child_process';
 import shuffle from 'array-shuffle';
 import {
   AudioPlayer,
@@ -20,8 +22,8 @@ import FileCacheProvider from './file-cache.js';
 import debug from '../utils/debug.js';
 import {getGuildSettings} from '../utils/get-guild-settings.js';
 import {buildPlayingMessageEmbed} from '../utils/build-embed.js';
-import {Setting} from '@prisma/client';
-
+// @ts-expect-error Prisma client types may not be generated in this environment
+import type {Setting} from '@prisma/client';
 export enum MediaSource {
   Youtube,
   HLS,
@@ -58,8 +60,6 @@ export interface PlayerEvents {
   statusChange: (oldStatus: STATUS, newStatus: STATUS) => void;
 }
 
-type YTDLVideoFormat = videoFormat & {loudnessDb?: number};
-
 export const DEFAULT_VOLUME = 100;
 
 export default class {
@@ -84,6 +84,11 @@ export default class {
   private disconnectTimer: NodeJS.Timeout | null = null;
 
   private readonly channelToSpeakingUsers: Map<string, Set<string>> = new Map();
+
+  private voiceEventsBound = false;
+  private audioPlayerEventsBound = false;
+  private currentFfmpeg: FfmpegCommand | null = null;
+  private currentYtDlp: ChildProcess | null = null;
 
   constructor(fileCache: FileCacheProvider, guildId: string) {
     this.fileCache = fileCache;
@@ -129,6 +134,7 @@ export default class {
 
   disconnect(): void {
     if (this.voiceConnection) {
+      this.teardownCurrentProcesses();
       if (this.status === STATUS.PLAYING) {
         this.pause();
       }
@@ -174,6 +180,7 @@ export default class {
         maxMissedFrames: 50,
       },
     });
+    this.audioPlayerEventsBound = false;
     this.voiceConnection.subscribe(this.audioPlayer);
     this.playAudioPlayerResource(this.createAudioStream(stream));
     this.attachListeners();
@@ -237,6 +244,7 @@ export default class {
           maxMissedFrames: 50,
         },
       });
+      this.audioPlayerEventsBound = false;
       this.voiceConnection.subscribe(this.audioPlayer);
       this.playAudioPlayerResource(this.createAudioStream(stream));
 
@@ -495,6 +503,7 @@ export default class {
   }
 
   private async getStream(song: QueuedSong, options: {seek?: number; to?: number} = {}): Promise<Readable> {
+    this.teardownCurrentProcesses();
     if (this.status === STATUS.PLAYING) {
       this.audioPlayer?.stop();
     } else if (this.status === STATUS.PAUSED) {
@@ -505,75 +514,10 @@ export default class {
       return this.createReadStream({url: song.url, cacheKey: song.url});
     }
 
-    let ffmpegInput: string | null;
     const ffmpegInputOptions: string[] = [];
     let shouldCacheVideo = false;
 
-    let format: YTDLVideoFormat | undefined;
-
-    ffmpegInput = await this.fileCache.getPathFor(this.getHashForCache(song.url));
-
-    if (!ffmpegInput) {
-      // Not yet cached, must download
-      const info = await ytdl.getInfo(song.url);
-
-      const formats = info.formats as YTDLVideoFormat[];
-
-      const filter = (format: ytdl.videoFormat): boolean => format.codecs === 'opus' && format.container === 'webm' && format.audioSampleRate !== undefined && parseInt(format.audioSampleRate, 10) === 48000;
-
-      format = formats.find(filter);
-
-      const nextBestFormat = (formats: ytdl.videoFormat[]): ytdl.videoFormat | undefined => {
-        if (formats.length < 1) {
-          return undefined;
-        }
-
-        if (formats[0].isLive) {
-          formats = formats.sort((a, b) => (b as unknown as {audioBitrate: number}).audioBitrate - (a as unknown as {audioBitrate: number}).audioBitrate); // Bad typings
-
-          return formats.find(format => [128, 127, 120, 96, 95, 94, 93].includes(parseInt(format.itag as unknown as string, 10))); // Bad typings
-        }
-
-        formats = formats
-          .filter(format => format.averageBitrate)
-          .sort((a, b) => {
-            if (a && b) {
-              return b.averageBitrate! - a.averageBitrate!;
-            }
-
-            return 0;
-          });
-        return formats.find(format => !format.bitrate) ?? formats[0];
-      };
-
-      if (!format) {
-        format = nextBestFormat(info.formats);
-
-        if (!format) {
-          // If still no format is found, throw
-          throw new Error('Can\'t find suitable format.');
-        }
-      }
-
-      debug('Using format', format);
-
-      ffmpegInput = format.url;
-
-      // Don't cache livestreams or long videos
-      const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
-      shouldCacheVideo = !info.player_response.videoDetails.isLiveContent && parseInt(info.videoDetails.lengthSeconds, 10) < MAX_CACHE_LENGTH_SECONDS && !options.seek;
-
-      debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
-
-      ffmpegInputOptions.push(...[
-        '-reconnect',
-        '1',
-        '-reconnect_streamed',
-        '1',
-        '-reconnect_delay_max',
-        '5',
-      ]);
-    }
+    const cachedPath = await this.fileCache.getPathFor(this.getHashForCache(song.url));
 
     if (options.seek) {
       ffmpegInputOptions.push('-ss', options.seek.toString());
@@ -583,12 +527,63 @@ export default class {
       ffmpegInputOptions.push('-to', options.to.toString());
     }
 
+    if (!cachedPath) {
+      const fullUrl = /^https?:\/\//.test(song.url) ? song.url : `https://www.youtube.com/watch?v=${song.url}`;
+      const ytdlpArgs = [
+        '-f',
+        'bestaudio*',
+        '--no-playlist',
+        '--quiet',
+        '--no-warnings',
+        '-o',
+        '-',
+        fullUrl,
+      ];
+
+      const ytdlp = spawn('yt-dlp', ytdlpArgs, {stdio: ['ignore', 'pipe', 'pipe']});
+      this.currentYtDlp = ytdlp;
+
+      let spawned = false;
+      ytdlp.on('spawn', () => {
+        spawned = true;
+        debug('Spawned yt-dlp for piping audio');
+      });
+
+      ytdlp.on('error', err => {
+        if (!spawned) {
+          debug(err);
+        }
+      });
+
+      // Don't cache livestreams or long videos
+      const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
+      shouldCacheVideo = !song.isLive && song.length < MAX_CACHE_LENGTH_SECONDS && !options.seek;
+      debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
+
+      if (!ytdlp.stdout) {
+        throw new Error('yt-dlp stdout not available');
+      }
+
+      return this.createReadStreamFromPipe({
+        input: ytdlp.stdout,
+        cacheKey: song.url,
+        ffmpegInputOptions,
+        cache: shouldCacheVideo,
+        volumeAdjustment: undefined,
+        onTeardown: () => {
+          try {
+            ytdlp.kill('SIGKILL');
+          } catch {}
+        },
+      });
+    }
+
     return this.createReadStream({
-      url: ffmpegInput,
+      url: cachedPath,
       cacheKey: song.url,
       ffmpegInputOptions,
       cache: shouldCacheVideo,
-      volumeAdjustment: format?.loudnessDb ? `${-format.loudnessDb}dB` : undefined,
+      volumeAdjustment: undefined,
     });
   }
 
@@ -617,16 +612,18 @@ export default class {
       return;
     }
 
-    if (this.voiceConnection.listeners(VoiceConnectionStatus.Disconnected).length === 0) {
+    if (!this.voiceEventsBound) {
       this.voiceConnection.on(VoiceConnectionStatus.Disconnected, this.onVoiceConnectionDisconnect.bind(this));
+      this.voiceEventsBound = true;
     }
 
     if (!this.audioPlayer) {
       return;
     }
 
-    if (this.audioPlayer.listeners('stateChange').length === 0) {
+    if (!this.audioPlayerEventsBound) {
       this.audioPlayer.on(AudioPlayerStatus.Idle, this.onAudioPlayerIdle.bind(this));
+      this.audioPlayerEventsBound = true;
     }
   }
 
@@ -671,7 +668,9 @@ export default class {
 
       if (options?.cache) {
         const cacheStream = this.fileCache.createWriteStream(this.getHashForCache(options.cacheKey));
-        capacitor.createReadStream().pipe(cacheStream);
+        /* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
+        (capacitor.createReadStream() as any).pipe(cacheStream as any);
+        /* eslint-enable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
       }
 
       const returnedStream = capacitor.createReadStream();
@@ -692,7 +691,9 @@ export default class {
           debug(`Spawned ffmpeg with ${command}`);
         });
 
-      stream.pipe(capacitor);
+      /* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
+      (stream as any).pipe(capacitor as any);
+      /* eslint-enable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
 
       returnedStream.on('close', () => {
         if (!options.cache) {
@@ -701,6 +702,57 @@ export default class {
 
         hasReturnedStreamClosed = true;
       });
+
+      // Keep reference for teardown
+      this.currentFfmpeg = stream as unknown as FfmpegCommand;
+
+      resolve(returnedStream);
+    });
+  }
+
+  private async createReadStreamFromPipe(options: {input: Readable; cacheKey: string; ffmpegInputOptions?: string[]; cache?: boolean; volumeAdjustment?: string; onTeardown?: () => void}): Promise<Readable> {
+    return new Promise((resolve, reject) => {
+      const capacitor = new WriteStream();
+
+      if (options?.cache) {
+        const cacheStream = this.fileCache.createWriteStream(this.getHashForCache(options.cacheKey));
+        /* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
+        (capacitor.createReadStream() as any).pipe(cacheStream as any);
+        /* eslint-enable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
+      }
+
+      const returnedStream = capacitor.createReadStream();
+      let hasReturnedStreamClosed = false;
+
+      const stream = ffmpeg(options.input as any)
+        .inputOptions(options?.ffmpegInputOptions ?? ['-re'])
+        .noVideo()
+        .audioCodec('libopus')
+        .outputFormat('webm')
+        .addOutputOption(['-filter:a', `volume=${options?.volumeAdjustment ?? '1'}`])
+        .on('error', error => {
+          if (!hasReturnedStreamClosed) {
+            reject(error);
+          }
+        })
+        .on('start', command => {
+          debug(`Spawned ffmpeg (pipe) with ${command}`);
+        });
+
+      /* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
+      (stream as any).pipe(capacitor as any);
+      /* eslint-enable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
+
+      returnedStream.on('close', () => {
+        if (options.onTeardown) {
+          options.onTeardown();
+        }
+
+        hasReturnedStreamClosed = true;
+      });
+
+      // Keep reference for teardown
+      this.currentFfmpeg = stream as unknown as FfmpegCommand;
 
       resolve(returnedStream);
     });
@@ -724,5 +776,22 @@ export default class {
   private setAudioPlayerVolume(level?: number) {
     // Audio resource expects a float between 0 and 1 to represent level percentage
     this.audioResource?.volume?.setVolume((level ?? this.getVolume()) / 100);
+  }
+
+  private teardownCurrentProcesses(): void {
+    try {
+      if (this.currentFfmpeg) {
+        (this.currentFfmpeg as unknown as {kill: (signal?: string) => void}).kill('SIGKILL');
+      }
+    } catch {}
+
+    try {
+      if (this.currentYtDlp) {
+        this.currentYtDlp.kill('SIGKILL');
+      }
+    } catch {}
+
+    this.currentFfmpeg = null;
+    this.currentYtDlp = null;
   }
 }

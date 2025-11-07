@@ -6,12 +6,25 @@ FROM node:22-bookworm-slim AS base
 RUN apt-get update \
     && apt-get install --no-install-recommends -y \
     ffmpeg \
+    curl \
     tini \
     openssl \
     ca-certificates \
     && apt-get autoclean \
     && apt-get autoremove \
     && rm -rf /var/lib/apt/lists/*
+
+# Install yt-dlp (standalone Linux binary per arch)
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) YT_BIN="yt-dlp_linux" ;; \
+      arm64) YT_BIN="yt-dlp_linux_aarch64" ;; \
+      armhf) YT_BIN="yt-dlp_linux_armv7l" ;; \
+      *) echo "Unsupported arch: $arch"; exit 1 ;; \
+    esac; \
+    curl -L "https://github.com/yt-dlp/yt-dlp/releases/latest/download/${YT_BIN}" -o /usr/local/bin/yt-dlp; \
+    chmod +x /usr/local/bin/yt-dlp
 
 # Install dependencies
 FROM base AS dependencies
